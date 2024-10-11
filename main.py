@@ -45,6 +45,11 @@ class DeribitWS:
         }
         self.positions_cache = {}
         self.available_markets = []  # Add this line to store available markets
+        self.available_instruments = {
+            'spot': [],
+            'futures': [],
+            'options': []
+        }
 
     async def connect(self, url, client_id, client_secret):
         try:
@@ -266,6 +271,9 @@ class DeribitWS:
                 elif message['action'] == 'get_open_orders':
                     open_orders = await self.get_open_orders()
                     await websocket.send_json(open_orders)
+                elif message['action'] == 'get_available_instruments':
+                    instruments = await self.get_available_instruments()
+                    await websocket.send_json({"type": "available_instruments", "data": instruments})
                 # ... handle other actions ...
         except WebSocketDisconnect:
             await self.remove_client(websocket)
@@ -434,6 +442,32 @@ class DeribitWS:
                     "error": str(e)
                 }
             }
+
+    async def get_available_instruments(self):
+        currencies = ['BTC', 'ETH']  # Add more currencies if needed
+        instrument_types = ['spot', 'future', 'option']
+        
+        for currency in currencies:
+            for instrument_type in instrument_types:
+                response = await self.send_request("public/get_instruments", {
+                    "currency": currency,
+                    "kind": instrument_type
+                })
+                if 'result' in response:
+                    category = instrument_type + 's' if instrument_type != 'spot' else 'spot'
+                    self.available_instruments[category].extend([
+                        {
+                            'instrument_name': instrument['instrument_name'],
+                            'kind': instrument['kind'],
+                            'contract_size': instrument.get('contract_size', 1),
+                            'settlement_period': instrument.get('settlement_period', 'perpetual'),
+                            'quote_currency': instrument['quote_currency'],
+                            'base_currency': instrument['base_currency']
+                        }
+                        for instrument in response['result']
+                    ])
+        
+        return self.available_instruments
 
 deribit_ws = DeribitWS()
 

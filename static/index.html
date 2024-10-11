@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deribit Trading Interface</title>
+    <title>GoQuant Trading Interface</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
@@ -23,16 +23,24 @@
         th {
             background-color: #f2f2f2;
         }
+        .instrument-type {
+            margin-bottom: 20px;
+        }
     </style>
 </head>
 <body>
-    <h1>Deribit Trading Interface</h1>
+    <h1>GoQuant Trading Interface</h1>
     
-    <select id="marketSelect">
-        <option value="">Select a market</option>
-    </select>
-    <button onclick="subscribeToMarket()">Subscribe</button>
-    <button onclick="unsubscribeFromMarket()">Unsubscribe</button>
+    <div id="instrumentSelection">
+        <h2>Select Instrument</h2>
+        <select id="instrumentType">
+            <option value="spot">Spot</option>
+            <option value="futures">Futures</option>
+            <option value="options">Options</option>
+        </select>
+        <select id="instrumentSelect"></select>
+        <button onclick="subscribeToInstrument()">Subscribe</button>
+    </div>
 
     <div id="orderbook">
         <div class="orderbook-side">
@@ -77,6 +85,8 @@
     <script>
         let ws;
         let chart;
+        let availableInstruments = {};
+        let currentSubscription = null;
 
         function connect() {
             ws = new WebSocket('ws://localhost:8000/ws');
@@ -86,22 +96,22 @@
                 setTimeout(connect, 1000);
             };
             ws.onopen = () => {
-                console.log('WebSocket connected. Fetching available markets...');
-                fetchAvailableMarkets();
+                console.log('WebSocket connected. Fetching available instruments...');
+                fetchAvailableInstruments();
             };
         }
 
         function handleMessage(event) {
             const message = JSON.parse(event.data);
             console.log('Received message:', message);
-            if (message.type === 'orderbook') {
+            if (message.type === 'available_instruments') {
+                updateInstrumentSelect(message.data);
+            } else if (message.type === 'orderbook') {
                 updateOrderbook(message.instrument, message.data);
             } else if (message.type === 'positions') {
                 updatePositions(message.data);
             } else if (message.type === 'open_orders') {
                 updateOpenOrders(message.data);
-            } else if (message.type === 'available_markets') {
-                updateMarketSelect(message.data);
             } else if (message.type === 'order_response') {
                 handleOrderResponse(message.data);
             }
@@ -179,58 +189,79 @@
             openOrdersElement.innerHTML = ordersHtml;
         }
 
-        function updateMarketSelect(markets) {
-            console.log('Updating market select with:', markets);
-            const marketSelect = document.getElementById('marketSelect');
-            marketSelect.innerHTML = '<option value="">Select a market</option>';
-            markets.forEach(market => {
+        function updateInstrumentSelect(instruments) {
+            availableInstruments = instruments;
+            const instrumentType = document.getElementById('instrumentType').value;
+            const instrumentSelect = document.getElementById('instrumentSelect');
+            instrumentSelect.innerHTML = '<option value="">Select an instrument</option>';
+            
+            instruments[instrumentType].forEach(instrument => {
                 const option = document.createElement('option');
-                option.value = market.instrument_name;
-                option.textContent = `${market.instrument_name}`;
-                option.dataset.contractSize = market.contract_size;
-                marketSelect.appendChild(option);
+                option.value = instrument.instrument_name;
+                option.textContent = `${instrument.instrument_name} (${instrument.settlement_period})`;
+                instrumentSelect.appendChild(option);
             });
-            marketSelect.addEventListener('change', updateContractSize);
         }
 
-        function updateContractSize() {
-            const marketSelect = document.getElementById('marketSelect');
-            const selectedOption = marketSelect.options[marketSelect.selectedIndex];
-            const contractSize = selectedOption.dataset.contractSize;
-            const contractSizeInfo = document.getElementById('contractSizeInfo');
-            if (contractSizeInfo) {
-                contractSizeInfo.textContent = `Contract Size: ${contractSize}`;
-            } else {
-                const infoElement = document.createElement('p');
-                infoElement.id = 'contractSizeInfo';
-                infoElement.textContent = `Contract Size: ${contractSize}`;
-                marketSelect.parentNode.insertBefore(infoElement, marketSelect.nextSibling);
-            }
-        }
+        document.getElementById('instrumentType').addEventListener('change', function() {
+            updateInstrumentSelect(availableInstruments);
+        });
 
-        function subscribeToMarket() {
-            const instrument = document.getElementById('marketSelect').value;
+        function subscribeToInstrument() {
+            const instrument = document.getElementById('instrumentSelect').value;
             if (instrument) {
+                if (currentSubscription) {
+                    unsubscribeFromInstrument(currentSubscription);
+                }
                 ws.send(JSON.stringify({action: 'subscribe', instrument: instrument}));
+                currentSubscription = instrument;
+                console.log(`Subscribed to ${instrument}`);
+            } else {
+                alert('Please select an instrument');
             }
         }
 
-        function unsubscribeFromMarket() {
-            const instrument = document.getElementById('marketSelect').value;
-            if (instrument) {
-                ws.send(JSON.stringify({action: 'unsubscribe', instrument: instrument}));
-            }
+        function unsubscribeFromInstrument(instrument) {
+            ws.send(JSON.stringify({action: 'unsubscribe', instrument: instrument}));
+            console.log(`Unsubscribed from ${instrument}`);
         }
 
         function placeOrder() {
+            const instrumentType = document.getElementById('instrumentType').value;
+            const symbol = document.getElementById('instrumentSelect').value;
+            const orderType = document.getElementById('orderType').value;
+            const side = document.getElementById('orderSide').value;
+            const amount = parseFloat(document.getElementById('orderAmount').value);
+            const price = parseFloat(document.getElementById('orderPrice').value);
+
+            if (!symbol) {
+                alert('Please select an instrument');
+                return;
+            }
+
+            if (!amount || amount <= 0) {
+                alert('Please enter a valid amount');
+                return;
+            }
+
             const order = {
                 action: 'place_order',
-                symbol: document.getElementById('marketSelect').value,
-                type: document.getElementById('orderType').value,
-                side: document.getElementById('orderSide').value,
-                amount: parseFloat(document.getElementById('orderAmount').value),
-                price: parseFloat(document.getElementById('orderPrice').value)
+                instrument_type: instrumentType,
+                symbol: symbol,
+                type: orderType,
+                side: side,
+                amount: amount
             };
+
+            if (orderType === 'limit' && (!price || price <= 0)) {
+                alert('Please enter a valid price for limit orders');
+                return;
+            }
+
+            if (orderType === 'limit') {
+                order.price = price;
+            }
+
             console.log('Sending place_order request:', order);
             ws.send(JSON.stringify(order));
         }
@@ -282,8 +313,8 @@
             document.getElementById(`modifyOrderForm-${orderId}`).remove();
         }
 
-        function fetchAvailableMarkets() {
-            ws.send(JSON.stringify({action: 'get_available_markets'}));
+        function fetchAvailableInstruments() {
+            ws.send(JSON.stringify({action: 'get_available_instruments'}));
         }
 
         function initChart() {
