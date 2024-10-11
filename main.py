@@ -28,7 +28,7 @@ class DeribitWS:
     def __init__(self):
         self.ws = None
         self.orderbook_cache = {}
-        self.clients = {}
+        self.clients = {}  # This should already be a dictionary
         self.request_id = 0
         self.response_futures = {}
         self.message_queue = asyncio.Queue()
@@ -43,6 +43,8 @@ class DeribitWS:
             "method": None,
             "params": None
         }
+        self.positions_cache = {}
+        self.available_markets = []  # Add this line to store available markets
 
     async def connect(self, url, client_id, client_secret):
         try:
@@ -105,7 +107,11 @@ class DeribitWS:
                 if data['id'] in self.response_futures:
                     self.response_futures[data['id']].set_result(data)
             elif 'method' in data and data['method'] == 'subscription':
-                await self.process_orderbook(data['params'])
+                if 'channel' in data['params']:
+                    if data['params']['channel'].startswith('book.'):
+                        await self.process_orderbook(data['params'])
+                    elif data['params']['channel'] == 'user.portfolio.btc':
+                        await self.process_positions(data['params'])
 
     async def process_orderbook(self, data):
         instrument = data['data']['instrument_name']
@@ -116,8 +122,20 @@ class DeribitWS:
         }
         await self.broadcast(instrument)
 
+    async def process_positions(self, data):
+        self.positions_cache = data['data']
+        await self.broadcast_positions()
+
+    async def broadcast_positions(self):
+        message = json.dumps({"type": "positions", "data": self.positions_cache})
+        for client in self.clients:
+            try:
+                await client.send_text(message)
+            except WebSocketDisconnect:
+                await self.remove_client(client)
+
     async def broadcast(self, instrument):
-        message = json.dumps(self.orderbook_cache[instrument])
+        message = json.dumps({"type": "orderbook", "instrument": instrument, "data": self.orderbook_cache[instrument]})
         for client, subscriptions in self.clients.items():
             if instrument in subscriptions:
                 try:
@@ -196,6 +214,227 @@ class DeribitWS:
             })
             del self.orderbook_cache[instrument]
 
+    async def subscribe_positions(self):
+        await self.send_request("private/subscribe", {
+            "channels": ["user.portfolio.btc"]
+        })
+
+    async def get_available_markets(self):
+        response = await self.send_request("public/get_instruments", {
+            "currency": "BTC",
+            "kind": "future"
+        })
+        self.available_markets = [
+            {
+                'instrument_name': instrument['instrument_name'],
+                'contract_size': instrument['contract_size']
+            }
+            for instrument in response['result']
+        ]
+        return self.available_markets
+
+    async def handle_websocket(self, websocket: WebSocket):
+        await websocket.accept()
+        self.clients[websocket] = set()
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                if message['action'] == 'get_available_markets':
+                    markets = await self.get_available_markets()
+                    await websocket.send_json({"type": "available_markets", "data": markets})
+                elif message['action'] == 'subscribe':
+                    instrument = message['instrument']
+                    self.clients[websocket].add(instrument)
+                    await self.subscribe_orderbook(instrument)
+                elif message['action'] == 'unsubscribe':
+                    instrument = message['instrument']
+                    self.clients[websocket].remove(instrument)
+                    await self.unsubscribe_orderbook(instrument)
+                elif message['action'] == 'place_order':
+                    response = await self.place_order(message)
+                    await websocket.send_json(response)
+                elif message['action'] == 'cancel_order':
+                    response = await self.cancel_order(message)
+                    await websocket.send_json(response)
+                elif message['action'] == 'modify_order':
+                    response = await self.modify_order(message)
+                    await websocket.send_json(response)
+                elif message['action'] == 'get_positions':
+                    positions = await self.get_positions()
+                    await websocket.send_json(positions)
+                elif message['action'] == 'get_open_orders':
+                    open_orders = await self.get_open_orders()
+                    await websocket.send_json(open_orders)
+                # ... handle other actions ...
+        except WebSocketDisconnect:
+            await self.remove_client(websocket)
+        except Exception as e:
+            logging.error(f"Error in handle_websocket: {str(e)}")
+            await websocket.send_json({"type": "error", "data": {"message": str(e)}})
+
+    async def place_order(self, order_data):
+        try:
+            # Extract order details
+            symbol = order_data['symbol']
+            order_type = order_data['type']
+            side = order_data['side']
+            amount = order_data['amount']
+            price = order_data.get('price')  # Price is optional for market orders
+
+            # Validate order data
+            if not all([symbol, order_type, side, amount]):
+                raise ValueError("Missing required order parameters")
+
+            # Place the order using the appropriate Deribit API method
+            if side == 'buy':
+                response = await self.buy_raw(symbol, amount, order_type, False, price, False)
+            elif side == 'sell':
+                response = await self.sell_raw(symbol, amount, order_type, False, price, False)
+            else:
+                raise ValueError("Invalid order side")
+
+            # Check if the order was placed successfully
+            if 'result' in response and 'order' in response['result']:
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": True,
+                        "order": response['result']['order']
+                    }
+                }
+            elif 'error' in response:
+                error_message = response['error'].get('message', 'Unknown error')
+                error_data = response['error'].get('data', {})
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": False,
+                        "error": f"{error_message}: {error_data}"
+                    }
+                }
+            else:
+                raise ValueError(f"Unexpected response from Deribit API: {response}")
+
+        except Exception as e:
+            logging.error(f"Error placing order: {str(e)}")
+            return {
+                "type": "order_response",
+                "data": {
+                    "success": False,
+                    "error": str(e)
+                }
+            }
+
+    async def get_positions(self):
+        try:
+            response = await self.send_request("private/get_positions", {"currency": "BTC"})
+            if 'result' in response:
+                return {
+                    "type": "positions",
+                    "data": response['result']
+                }
+            else:
+                raise ValueError(f"Unexpected response from Deribit API: {response}")
+        except Exception as e:
+            logging.error(f"Error fetching positions: {str(e)}")
+            return {
+                "type": "positions",
+                "data": []
+            }
+
+    async def get_open_orders(self):
+        try:
+            response = await self.send_request("private/get_open_orders_by_currency", {"currency": "BTC"})
+            if 'result' in response:
+                return {
+                    "type": "open_orders",
+                    "data": response['result']
+                }
+            else:
+                raise ValueError(f"Unexpected response from Deribit API: {response}")
+        except Exception as e:
+            logging.error(f"Error fetching open orders: {str(e)}")
+            return {
+                "type": "open_orders",
+                "data": []
+            }
+
+    async def cancel_order(self, order_data):
+        try:
+            order_id = order_data['order_id']
+            response = await self.send_request("private/cancel", {"order_id": order_id})
+
+            if 'result' in response:
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": True,
+                        "order": response['result']
+                    }
+                }
+            elif 'error' in response:
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": False,
+                        "error": response['error']['message']
+                    }
+                }
+            else:
+                raise ValueError(f"Unexpected response from Deribit API: {response}")
+
+        except Exception as e:
+            logging.error(f"Error cancelling order: {str(e)}")
+            return {
+                "type": "order_response",
+                "data": {
+                    "success": False,
+                    "error": str(e)
+                }
+            }
+
+    async def modify_order(self, order_data):
+        try:
+            order_id = order_data['order_id']
+            params = {"order_id": order_id}
+            
+            if 'amount' in order_data:
+                params['amount'] = order_data['amount']
+            if 'price' in order_data:
+                params['price'] = order_data['price']
+
+            response = await self.send_request("private/edit", params)
+
+            if 'result' in response:
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": True,
+                        "order": response['result']
+                    }
+                }
+            elif 'error' in response:
+                return {
+                    "type": "order_response",
+                    "data": {
+                        "success": False,
+                        "error": response['error']['message']
+                    }
+                }
+            else:
+                raise ValueError(f"Unexpected response from Deribit API: {response}")
+
+        except Exception as e:
+            logging.error(f"Error modifying order: {str(e)}")
+            return {
+                "type": "order_response",
+                "data": {
+                    "success": False,
+                    "error": str(e)
+                }
+            }
+
 deribit_ws = DeribitWS()
 
 @app.on_event("startup")
@@ -205,10 +444,11 @@ async def startup_event():
     try:
         await deribit_ws.connect('wss://test.deribit.com/ws/api/v2', client_id, client_secret)
         asyncio.create_task(deribit_ws.process_messages())
+        await deribit_ws.subscribe_positions()
         logger.info("Startup completed successfully")
     except Exception as e:
         logger.error(f"Error during startup: {str(e)}")
-        # You might want to exit the application here if startup fails
+        # You might want to exit the application here if startup failsx
         # import sys
         # sys.exit(1)
 
@@ -218,16 +458,7 @@ async def read_root():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await deribit_ws.add_client(websocket)
-    try:
-        while True:
-            message = await websocket.receive_json()
-            if message['action'] == 'subscribe':
-                await deribit_ws.subscribe_client(websocket, message['instrument'])
-            elif message['action'] == 'unsubscribe':
-                await deribit_ws.unsubscribe_client(websocket, message['instrument'])
-    except WebSocketDisconnect:
-        await deribit_ws.remove_client(websocket)
+    await deribit_ws.handle_websocket(websocket)
 
 class OrderRequest(BaseModel):
     symbol: str
@@ -288,6 +519,14 @@ async def get_account_summary(currency: str):
 async def get_ticker(instrument_name: str):
     response = await deribit_ws.ticker(instrument_name)
     return json.loads(response)
+
+@app.get("/get_positions")
+async def get_positions():
+    try:
+        response = await deribit_ws.send_request("private/get_positions", {"currency": "BTC"})
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching positions: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown_event():

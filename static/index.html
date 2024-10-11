@@ -4,14 +4,25 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Deribit Trading Interface</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
         select, input, button { margin: 5px; padding: 5px; }
         #orderbook { display: flex; justify-content: space-around; }
         .orderbook-side { width: 45%; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
     </style>
 </head>
 <body>
@@ -38,6 +49,8 @@
         </div>
     </div>
 
+    <canvas id="orderbook-chart"></canvas>
+
     <h2>Place Order</h2>
     <select id="orderType">
         <option value="market">Market</option>
@@ -51,277 +64,287 @@
     <input id="orderPrice" type="number" step="0.01" placeholder="Price (for limit orders)">
     <button onclick="placeOrder()">Place Order</button>
 
-    <h2>Cancel Order</h2>
-    <input id="cancelOrderId" placeholder="Order ID">
-    <button onclick="cancelOrder()">Cancel Order</button>
 
-    <h2>Modify Order</h2>
-    <input id="modifyOrderId" placeholder="Order ID">
-    <input id="modifyAmount" type="number" step="0.00000001" placeholder="New Amount">
-    <input id="modifyPrice" type="number" step="0.01" placeholder="New Price">
-    <button onclick="modifyOrder()">Modify Order</button>
 
     <h2>Current Positions</h2>
-    <button onclick="viewPositions()">View Positions</button>
+    <button onclick="getPositions()">Refresh Positions</button>
     <div id="positions"></div>
 
+    <h2>Open Orders</h2>
+    <button onclick="getOpenOrders()">Refresh Open Orders</button>
+    <div id="openOrders"></div>
+
     <script>
-        const ws = new WebSocket('ws://localhost:8000/ws');
-        let currentMarket = '';
-        let instrumentInfo = {};
+        let ws;
+        let chart;
 
-        ws.onopen = () => {
-            console.log('Connected to WebSocket server');
-            fetchMarkets();
-        };
+        function connect() {
+            ws = new WebSocket('ws://localhost:8000/ws');
+            ws.onmessage = handleMessage;
+            ws.onclose = () => {
+                console.log('WebSocket closed. Reconnecting...');
+                setTimeout(connect, 1000);
+            };
+            ws.onopen = () => {
+                console.log('WebSocket connected. Fetching available markets...');
+                fetchAvailableMarkets();
+            };
+        }
 
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            updateOrderbook(data);
-        };
+        function handleMessage(event) {
+            const message = JSON.parse(event.data);
+            console.log('Received message:', message);
+            if (message.type === 'orderbook') {
+                updateOrderbook(message.instrument, message.data);
+            } else if (message.type === 'positions') {
+                updatePositions(message.data);
+            } else if (message.type === 'open_orders') {
+                updateOpenOrders(message.data);
+            } else if (message.type === 'available_markets') {
+                updateMarketSelect(message.data);
+            } else if (message.type === 'order_response') {
+                handleOrderResponse(message.data);
+            }
+        }
 
-        function fetchMarkets() {
-            fetch('https://test.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=future')
-                .then(response => response.json())
-                .then(data => {
-                    const select = document.getElementById('marketSelect');
-                    data.result.forEach(instrument => {
-                        const option = document.createElement('option');
-                        option.value = instrument.instrument_name;
-                        option.textContent = instrument.instrument_name;
-                        select.appendChild(option);
-                        
-                        // Store instrument info
-                        instrumentInfo[instrument.instrument_name] = {
-                            contractSize: instrument.contract_size,
-                            quoteCurrency: instrument.quote_currency
-                        };
-                    });
-                });
+        function handleOrderResponse(data) {
+            if (data.success) {
+                console.log('Order action successful:', data.order);
+                alert('Order action successful!');
+                getOpenOrders(); // Refresh the open orders list
+            } else {
+                console.error('Order action failed:', data.error);
+                alert('Order action failed: ' + data.error);
+            }
+        }
+
+        function updateOrderbook(instrument, data) {
+            const bids = data.bids.map(bid => ({ price: bid[0], amount: bid[1] }));
+            const asks = data.asks.map(ask => ({ price: ask[0], amount: ask[1] }));
+
+            // Update the orderbook chart
+            chart.data.datasets[0].data = bids.map(bid => ({ x: bid.price, y: bid.amount }));
+            chart.data.datasets[1].data = asks.map(ask => ({ x: ask.price, y: ask.amount }));
+            chart.options.plugins.title.text = `Orderbook for ${instrument}`;
+            chart.update();
+
+            // Update the orderbook tables
+            updateOrderbookTable('bidsTable', bids);
+            updateOrderbookTable('asksTable', asks);
+        }
+
+        function updateOrderbookTable(tableId, data) {
+            const table = document.getElementById(tableId);
+            table.innerHTML = '<tr><th>Price</th><th>Amount</th></tr>';
+            data.forEach(item => {
+                const row = table.insertRow(-1);
+                row.insertCell(0).textContent = item.price.toFixed(2);
+                row.insertCell(1).textContent = item.amount.toFixed(8);
+            });
+        }
+
+        function updatePositions(positions) {
+            const positionsElement = document.getElementById('positions');
+            let positionsHtml = '<table><tr><th>Instrument</th><th>Size</th><th>Average Price</th><th>Direction</th></tr>';
+            positions.forEach(position => {
+                positionsHtml += `<tr>
+                    <td>${position.instrument_name}</td>
+                    <td>${position.size}</td>
+                    <td>${position.average_price}</td>
+                    <td>${position.direction}</td>
+                </tr>`;
+            });
+            positionsHtml += '</table>';
+            positionsElement.innerHTML = positionsHtml;
+        }
+
+        function updateOpenOrders(orders) {
+            const openOrdersElement = document.getElementById('openOrders');
+            let ordersHtml = '<table><tr><th>Order ID</th><th>Instrument</th><th>Amount</th><th>Price</th><th>Type</th><th>Side</th><th>Actions</th></tr>';
+            orders.forEach(order => {
+                ordersHtml += `<tr>
+                    <td>${order.order_id}</td>
+                    <td>${order.instrument_name}</td>
+                    <td>${order.amount}</td>
+                    <td>${order.price}</td>
+                    <td>${order.order_type}</td>
+                    <td>${order.direction}</td>
+                    <td>
+                        <button onclick="cancelOrder('${order.order_id}')">Cancel</button>
+                        <button onclick="showModifyOrderForm('${order.order_id}', ${order.amount}, ${order.price})">Modify</button>
+                    </td>
+                </tr>`;
+            });
+            ordersHtml += '</table>';
+            openOrdersElement.innerHTML = ordersHtml;
+        }
+
+        function updateMarketSelect(markets) {
+            console.log('Updating market select with:', markets);
+            const marketSelect = document.getElementById('marketSelect');
+            marketSelect.innerHTML = '<option value="">Select a market</option>';
+            markets.forEach(market => {
+                const option = document.createElement('option');
+                option.value = market.instrument_name;
+                option.textContent = `${market.instrument_name}`;
+                option.dataset.contractSize = market.contract_size;
+                marketSelect.appendChild(option);
+            });
+            marketSelect.addEventListener('change', updateContractSize);
+        }
+
+        function updateContractSize() {
+            const marketSelect = document.getElementById('marketSelect');
+            const selectedOption = marketSelect.options[marketSelect.selectedIndex];
+            const contractSize = selectedOption.dataset.contractSize;
+            const contractSizeInfo = document.getElementById('contractSizeInfo');
+            if (contractSizeInfo) {
+                contractSizeInfo.textContent = `Contract Size: ${contractSize}`;
+            } else {
+                const infoElement = document.createElement('p');
+                infoElement.id = 'contractSizeInfo';
+                infoElement.textContent = `Contract Size: ${contractSize}`;
+                marketSelect.parentNode.insertBefore(infoElement, marketSelect.nextSibling);
+            }
         }
 
         function subscribeToMarket() {
-            const market = document.getElementById('marketSelect').value;
-            if (market) {
-                currentMarket = market;
-                ws.send(JSON.stringify({ action: 'subscribe', instrument: market }));
+            const instrument = document.getElementById('marketSelect').value;
+            if (instrument) {
+                ws.send(JSON.stringify({action: 'subscribe', instrument: instrument}));
             }
         }
 
         function unsubscribeFromMarket() {
-            if (currentMarket) {
-                ws.send(JSON.stringify({ action: 'unsubscribe', instrument: currentMarket }));
-                currentMarket = '';
-                clearOrderbook();
+            const instrument = document.getElementById('marketSelect').value;
+            if (instrument) {
+                ws.send(JSON.stringify({action: 'unsubscribe', instrument: instrument}));
             }
         }
 
-        function updateOrderbook(data) {
-            const bidsTable = document.getElementById('bidsTable');
-            const asksTable = document.getElementById('asksTable');
+        function placeOrder() {
+            const order = {
+                action: 'place_order',
+                symbol: document.getElementById('marketSelect').value,
+                type: document.getElementById('orderType').value,
+                side: document.getElementById('orderSide').value,
+                amount: parseFloat(document.getElementById('orderAmount').value),
+                price: parseFloat(document.getElementById('orderPrice').value)
+            };
+            console.log('Sending place_order request:', order);
+            ws.send(JSON.stringify(order));
+        }
+
+        function cancelOrder(orderId) {
+            console.log('Sending cancel_order request:', orderId);
+            ws.send(JSON.stringify({
+                action: 'cancel_order',
+                order_id: orderId
+            }));
+        }
+
+        function showModifyOrderForm(orderId, currentAmount, currentPrice) {
+            const formHtml = `
+                <form id="modifyOrderForm-${orderId}" onsubmit="modifyOrder('${orderId}', ${currentAmount}, ${currentPrice}); return false;">
+                    <input type="number" id="modifyAmount-${orderId}" value="${currentAmount}" step="0.00000001" placeholder="New Amount (optional)">
+                    <input type="number" id="modifyPrice-${orderId}" value="${currentPrice}" step="0.01" placeholder="New Price (optional)">
+                    <button type="submit">Modify Order</button>
+                </form>
+            `;
+            document.getElementById('openOrders').insertAdjacentHTML('beforeend', formHtml);
+        }
+
+        function modifyOrder(orderId, currentAmount, currentPrice) {
+            const newAmount = document.getElementById(`modifyAmount-${orderId}`).value;
+            const newPrice = document.getElementById(`modifyPrice-${orderId}`).value;
             
-            // Clear previous data
-            bidsTable.innerHTML = '<tr><th>Price</th><th>Amount</th></tr>';
-            asksTable.innerHTML = '<tr><th>Price</th><th>Amount</th></tr>';
-
-            // Update bids
-            data.bids.forEach(bid => {
-                const row = bidsTable.insertRow(-1);
-                row.insertCell(0).textContent = bid[0];
-                row.insertCell(1).textContent = bid[1];
-            });
-
-            // Update asks
-            data.asks.forEach(ask => {
-                const row = asksTable.insertRow(-1);
-                row.insertCell(0).textContent = ask[0];
-                row.insertCell(1).textContent = ask[1];
-            });
-        }
-
-        function clearOrderbook() {
-            document.getElementById('bidsTable').innerHTML = '<tr><th>Price</th><th>Amount</th></tr>';
-            document.getElementById('asksTable').innerHTML = '<tr><th>Price</th><th>Amount</th></tr>';
-        }
-
-        async function placeOrder() {
-            const symbol = document.getElementById('marketSelect').value;
-            const orderType = document.getElementById('orderType').value;
-            const side = document.getElementById('orderSide').value;
-            const amount = parseFloat(document.getElementById('orderAmount').value);
-            const price = document.getElementById('orderPrice').value ? parseFloat(document.getElementById('orderPrice').value) : null;
-
-            if (!symbol) {
-                alert('Please select a market');
-                return;
-            }
-
-            if (!amount) {
-                alert('Please enter an amount');
-                return;
-            }
-
-            if (orderType === 'limit' && !price) {
-                alert('Please enter a price for limit orders');
-                return;
-            }
-
-            // Check if amount is a multiple of contract size
-            const contractSize = instrumentInfo[symbol].contractSize;
-            if (amount % contractSize !== 0) {
-                alert(`Amount must be a multiple of the contract size (${contractSize})`);
-                return;
-            }
-
-            const orderData = {
-                symbol: symbol,
-                type: orderType,
-                side: side,
-                amount: amount,
-                price: price
+            const modifyOrderRequest = {
+                action: 'modify_order',
+                order_id: orderId
             };
 
-            try {
-                const response = await fetch('http://localhost:8000/place_order', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(orderData),
-                });
+            if (newAmount && newAmount !== currentAmount.toString()) {
+                modifyOrderRequest.amount = parseFloat(newAmount);
+            }
 
-                const result = await response.json();
-                console.log('Order response:', result);
-                
-                if (result.error) {
-                    let errorMessage = `Error placing order:\n`;
-                    errorMessage += `Message: ${result.error.message}\n`;
-                    errorMessage += `Code: ${result.error.code}\n`;
-                    if (result.error.data) {
-                        errorMessage += `Param: ${result.error.data.param}\n`;
-                        errorMessage += `Reason: ${result.error.data.reason}\n`;
+            if (newPrice && newPrice !== currentPrice.toString()) {
+                modifyOrderRequest.price = parseFloat(newPrice);
+            }
+
+            if (modifyOrderRequest.amount || modifyOrderRequest.price) {
+                console.log('Sending modify_order request:', modifyOrderRequest);
+                ws.send(JSON.stringify(modifyOrderRequest));
+            } else {
+                console.log('No changes to modify in the order');
+            }
+
+            // Remove the form after submission
+            document.getElementById(`modifyOrderForm-${orderId}`).remove();
+        }
+
+        function fetchAvailableMarkets() {
+            ws.send(JSON.stringify({action: 'get_available_markets'}));
+        }
+
+        function initChart() {
+            const ctx = document.getElementById('orderbook-chart').getContext('2d');
+            chart = new Chart(ctx, {
+                type: 'scatter',
+                data: {
+                    datasets: [{
+                        label: 'Bids',
+                        data: [],
+                        backgroundColor: 'rgba(0, 255, 0, 0.5)'
+                    }, {
+                        label: 'Asks',
+                        data: [],
+                        backgroundColor: 'rgba(255, 0, 0, 0.5)'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            position: 'bottom',
+                            title: {
+                                display: true,
+                                text: 'Price'
+                            }
+                        },
+                        y: {
+                            type: 'linear',
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'Amount'
+                            }
+                        }
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Orderbook'
+                        }
                     }
-                    alert(errorMessage);
-                } else if (result.result) {
-                    let message = 'Order placed successfully:\n';
-                    message += `Order ID: ${result.result.order.order_id}\n`;
-                    message += `Price: ${result.result.order.price}\n`;
-                    message += `Amount: ${result.result.order.amount}\n`;
-                    message += `Order State: ${result.result.order.order_state}\n`;
-                    message += `Contract Size: ${contractSize} ${instrumentInfo[symbol].quoteCurrency}\n`;
-                    const totalValue = result.result.order.amount * contractSize;
-                    message += `Total Value: ${totalValue} ${instrumentInfo[symbol].quoteCurrency}\n`;
-                    alert(message);
                 }
-            } catch (error) {
-                console.error('Error placing order:', error);
-                alert(`Error placing order: ${error.message}`);
-            }
+            });
         }
 
-        async function cancelOrder() {
-            const orderId = document.getElementById('cancelOrderId').value;
-            const symbol = document.getElementById('marketSelect').value;
-
-            if (!orderId) {
-                alert('Please enter an Order ID');
-                return;
-            }
-
-            if (!symbol) {
-                alert('Please select a market');
-                return;
-            }
-
-            try {
-                const response = await fetch('http://localhost:8000/cancel_order', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ id: orderId, symbol: symbol }),
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Failed to cancel order');
-                }
-
-                const result = await response.json();
-                console.log('Order cancelled:', result);
-                alert('Order cancelled successfully');
-            } catch (error) {
-                console.error('Error cancelling order:', error);
-                alert(`Error cancelling order: ${error.message}`);
-            }
+        function getPositions() {
+            ws.send(JSON.stringify({action: 'get_positions'}));
         }
 
-        async function modifyOrder() {
-            const orderId = document.getElementById('modifyOrderId').value;
-            const symbol = document.getElementById('marketSelect').value;
-            const newAmount = document.getElementById('modifyAmount').value;
-            const newPrice = document.getElementById('modifyPrice').value;
-
-            if (!orderId) {
-                alert('Please enter an Order ID');
-                return;
-            }
-
-            if (!symbol) {
-                alert('Please select a market');
-                return;
-            }
-
-            if (!newAmount && !newPrice) {
-                alert('Please enter a new amount or price');
-                return;
-            }
-
-            const modifyData = {
-                id: orderId,
-                symbol: symbol,
-                amount: newAmount ? parseFloat(newAmount) : undefined,
-                price: newPrice ? parseFloat(newPrice) : undefined
-            };
-
-            try {
-                const response = await fetch('http://localhost:8000/modify_order', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(modifyData),
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Failed to modify order');
-                }
-
-                const result = await response.json();
-                console.log('Order modified:', result);
-                alert('Order modified successfully');
-            } catch (error) {
-                console.error('Error modifying order:', error);
-                alert(`Error modifying order: ${error.message}`);
-            }
+        function getOpenOrders() {
+            ws.send(JSON.stringify({action: 'get_open_orders'}));
         }
 
-        async function viewPositions() {
-            try {
-                const response = await fetch('http://localhost:8000/get_positions');
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Failed to fetch positions');
-                }
-                const result = await response.json();
-                console.log('Positions:', result);
-                document.getElementById('positions').textContent = JSON.stringify(result, null, 2);
-            } catch (error) {
-                console.error('Error fetching positions:', error);
-                document.getElementById('positions').textContent = `Error: ${error.message}`;
-            }
-        }
+        window.onload = () => {
+            connect();
+            initChart();
+            getPositions();
+            getOpenOrders();
+        };
     </script>
 </body>
 </html>
